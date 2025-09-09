@@ -1,14 +1,9 @@
-Options Flow Summarizer — Cloud Deployment (Full Version)
+Options Flow Summarizer — Fixed Version
 
-Deploy on Streamlit Cloud:
-1) Create a new GitHub repo and add:
-   - streamlit_app.py
-   - requirements.txt
-2) Go to https://share.streamlit.io (Streamlit Cloud) → New app
-3) Select your repo, branch = main, file = streamlit_app.py
-4) Deploy, open the app URL, upload your CSV, and download the summary.
+This version fixes issues with parsing the `Expires` column in uploaded CSVs.
+- Handles mixed formats, blanks, and timezone-aware strings safely.
 
-Notes
-- This version computes: strike distance zones, OI vs Volume vs Size, DTE concentration,
-  key levels narrative, and strategy considerations (non-advice).
-- Works best with Barchart-like exports; columns are normalized flexibly.
+Steps to deploy:
+1) Upload these files to your GitHub repo (replace old ones).
+2) Go to Streamlit Cloud → Manage app → Restart.
+3) Upload your CSV and the error will be resolved.
