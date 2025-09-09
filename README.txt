@@ -1,14 +1,14 @@
-# Options Flow Summarizer - Cloud Deployment
+Options Flow Summarizer — Cloud Deployment (Full Version)
 
-## Deployment Steps
-1. Upload this folder to a new GitHub repository.
-2. Go to [Streamlit Cloud](https://share.streamlit.io).
-3. Create a new app and point it to your repository.
-4. Select `streamlit_app.py` as the main file.
-5. Deploy the app and open the provided URL.
-6. Upload your options flow CSV to generate summaries.
+Deploy on Streamlit Cloud:
+1) Create a new GitHub repo and add:
+   - streamlit_app.py
+   - requirements.txt
+2) Go to https://share.streamlit.io (Streamlit Cloud) → New app
+3) Select your repo, branch = main, file = streamlit_app.py
+4) Deploy, open the app URL, upload your CSV, and download the summary.
 
-## Files Included
-- streamlit_app.py (Main web app code)
-- requirements.txt (Dependencies for Streamlit Cloud)
-- README.txt (Deployment instructions)
+Notes
+- This version computes: strike distance zones, OI vs Volume vs Size, DTE concentration,
+  key levels narrative, and strategy considerations (non-advice).
+- Works best with Barchart-like exports; columns are normalized flexibly.
