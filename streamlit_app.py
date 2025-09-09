@@ -66,6 +66,77 @@ def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def _money(x):
+    try:
+        return f"${float(x):,.0f}"
+    except:
+        return str(x)
+
+# --------------------------- Summary Logic ---------------------------
+
+def summarize_data(df: pd.DataFrame):
+    total_premium = df["premium"].sum(skipna=True)
+    calls_premium = df.loc[df["type"] == "Call", "premium"].sum(skipna=True)
+    puts_premium = df.loc[df["type"] == "Put", "premium"].sum(skipna=True)
+
+    # IV
+    iv_mean = df["iv"].mean(skipna=True)
+    iv_max = df["iv"].max(skipna=True)
+
+    # Top expirations
+    top_expirations = df.groupby("exp_date")["premium"].sum().sort_values(ascending=False).head(5)
+
+    # Top strikes
+    top_strikes = (
+        df.groupby(["type", "strike"])["premium"]
+        .sum()
+        .reset_index()
+        .sort_values("premium", ascending=False)
+        .head(10)
+    )
+
+    # Volume / OI
+    df["vol_oi_ratio"] = df.apply(
+        lambda r: r["volume"] / (r["open_interest"] + 1.0) if pd.notnull(r["open_interest"]) else np.nan,
+        axis=1
+    )
+
+    # Narrative
+    narrative = []
+
+    # Premium balance
+    if puts_premium > calls_premium * 1.5:
+        narrative.append("**Flow heavily bearish:** Puts dominate premium flow.")
+    elif calls_premium > puts_premium * 1.5:
+        narrative.append("**Flow heavily bullish:** Calls dominate premium flow.")
+    else:
+        narrative.append("**Flow balanced:** Calls and puts are roughly equal.")
+
+    # IV level
+    if iv_mean > 0.8:
+        narrative.append("**IV is elevated** → Good environment for premium selling (CSPs, covered calls, credit spreads).")
+    elif iv_mean < 0.3:
+        narrative.append("**IV is low** → Good environment for long debit strategies (long calls/puts, debit spreads).")
+
+    # Top levels analysis
+    narrative.append("\n**Key Strikes and Levels:**")
+    for _, row in top_strikes.iterrows():
+        t = row["type"]
+        narrative.append(f"- {t} {row['strike']}: {_money(row['premium'])} total premium")
+
+    return {
+        "total_premium": total_premium,
+        "calls_premium": calls_premium,
+        "puts_premium": puts_premium,
+        "iv_mean": iv_mean,
+        "iv_max": iv_max,
+        "top_expirations": top_expirations,
+        "top_strikes": top_strikes,
+        "narrative": narrative
+    }
+
+# --------------------------- UI ---------------------------
+
 st.title("Options Flow Summarizer — Key Levels, OI/Volume/Size, Strategy Hints")
 st.caption("Upload an options-flow CSV (e.g., Barchart export). No manual inputs required.")
 
@@ -82,7 +153,38 @@ if uploaded is not None:
         st.dataframe(raw.head(25), use_container_width=True)
 
     df = _norm_cols(raw)
-    st.success("CSV parsed successfully! Here's a preview of normalized data:")
+
+    st.success("CSV normalized successfully! Here's a preview:")
     st.dataframe(df.head(10))
+
+    # Generate summary
+    results = summarize_data(df)
+
+    st.subheader("Summary Metrics")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Premium", _money(results["total_premium"]))
+    col2.metric("Calls Premium", _money(results["calls_premium"]))
+    col3.metric("Puts Premium", _money(results["puts_premium"]))
+    col4.metric("Mean IV", f"{results['iv_mean']:.2f}")
+
+    st.subheader("Top Expirations by Premium")
+    st.dataframe(results["top_expirations"].rename("Premium ($)").to_frame())
+
+    st.subheader("Top Strikes by Premium")
+    st.dataframe(results["top_strikes"])
+
+    st.subheader("Narrative Summary")
+    for line in results["narrative"]:
+        st.markdown(line)
+
+    # Download summary as Markdown
+    summary_md = "# Options Flow Summary\n\n" + "\n".join(results["narrative"])
+    st.download_button(
+        label="Download Summary (Markdown)",
+        data=summary_md.encode("utf-8"),
+        file_name="options_flow_summary.md",
+        mime="text/markdown"
+    )
+
 else:
     st.info("Upload a CSV to get started. Barchart-style exports work best.")

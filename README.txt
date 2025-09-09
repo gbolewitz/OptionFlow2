@@ -1,9 +1,18 @@
-Options Flow Summarizer — Fixed Version
+Options Flow Summarizer - Final Version
 
-This version fixes issues with parsing the `Expires` column in uploaded CSVs.
-- Handles mixed formats, blanks, and timezone-aware strings safely.
+This version includes:
+- Fixed date parsing for `Expires` column
+- Full analytics:
+  - Key levels from strikes
+  - OI vs Volume analysis
+  - Institutional activity detection
+  - DTE concentration
+  - Narrative summary with strategy suggestions
+  - Downloadable Markdown summary
 
-Steps to deploy:
-1) Upload these files to your GitHub repo (replace old ones).
-2) Go to Streamlit Cloud → Manage app → Restart.
-3) Upload your CSV and the error will be resolved.
+Deployment:
+1) Upload these files to your GitHub repo.
+2) Go to Streamlit Cloud → New App.
+3) Choose `streamlit_app.py` as the entry file.
+4) Deploy and open your app.
+5) Upload a CSV to see the full analysis and download the report.
