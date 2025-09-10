@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Options Flow Summarizer (Pro Signals) — v1.1", layout="wide")
+st.set_page_config(page_title="Options Flow Summarizer (Pro + Weighted Bias)", layout="wide")
 
 # ============================
 # Normalization
@@ -71,7 +71,7 @@ def _money(x):
     except: return str(x)
 
 # ============================
-# Aggregations (with robust merges to avoid KeyError)
+# Aggregations (robust merges)
 # ============================
 def _aggregate(df: pd.DataFrame):
     tot_prem = df["premium"].sum(skipna=True)
@@ -95,22 +95,19 @@ def _aggregate(df: pd.DataFrame):
         iv_mean=("iv","mean"),
     )
 
-    # Totals and institutional sizes as DataFrames
     totals_df  = df.groupby(grp_cols, as_index=False)["size"].sum().rename(columns={"size":"total_size"})
     inst100_df = df[df["size"]>=100].groupby(grp_cols, as_index=False)["size"].sum().rename(columns={"size":"inst_size_ge100"})
     inst500_df = df[df["size"]>=500].groupby(grp_cols, as_index=False)["size"].sum().rename(columns={"size":"inst_size_ge500"})
 
-    by_strike = grouped.merge(totals_df, on=grp_cols, how="left")
-    by_strike = by_strike.merge(inst100_df, on=grp_cols, how="left")
-    by_strike = by_strike.merge(inst500_df, on=grp_cols, how="left")
+    by_strike = grouped.merge(totals_df, on=grp_cols, how="left")\
+                       .merge(inst100_df, on=grp_cols, how="left")\
+                       .merge(inst500_df, on=grp_cols, how="left")
 
-    # Ensure presence and fill
     for col in ["total_size","inst_size_ge100","inst_size_ge500"]:
         if col not in by_strike.columns:
             by_strike[col] = 0.0
     by_strike[["total_size","inst_size_ge100","inst_size_ge500"]] = by_strike[["total_size","inst_size_ge100","inst_size_ge500"]].fillna(0.0)
 
-    # Derived metrics
     by_strike["vol_oi_ratio"] = by_strike.apply(lambda r: (r["vol"]/(r["oi"]+1.0)) if pd.notnull(r["oi"]) else np.nan, axis=1)
     by_strike["strike_distance_pct"] = (by_strike["strike"] - by_strike["under_px"]) / by_strike["under_px"] * 100.0
     by_strike["inst_share_ge100"] = np.where(by_strike["total_size"]>0, by_strike["inst_size_ge100"]/by_strike["total_size"], np.nan)
@@ -120,12 +117,75 @@ def _aggregate(df: pd.DataFrame):
             "exp_prem":exp_prem,"top_strikes":top_strikes,"dte_prem":dte_prem,"by_strike":by_strike}
 
 # ============================
+# Weighted Bias (per key level)
+# ============================
+def _positioning_tag(voi):
+    if pd.isna(voi): return "unknown"
+    if voi > 1.0: return "new positioning"
+    if voi < 0.5: return "closing/rolling"
+    return "balanced"
+
+def _zone_tag(dist):
+    if pd.isna(dist): return "unknown"
+    if dist <= -2: return "support zone"
+    if -2 < dist < 2: return "near ATM"
+    return "resistance zone"
+
+def _weighted_bias_row(row):
+    # Base polarity: Call=+1, Put=-1
+    sign = 1.0 if str(row.get("type","")).lower() == "call" else -1.0
+
+    score = 0.0
+    # Positioning weight
+    voi = row.get("vol_oi_ratio", np.nan)
+    if not pd.isna(voi):
+        if voi > 1.0:
+            score += 1.0 * sign                      # opening -> aligns with type
+            score += min(0.3*(voi-1.0), 0.6) * sign  # magnitude boost
+        elif voi < 0.5:
+            score += -0.7 * sign                     # closing -> against type
+            score += -min(0.3*(0.5-voi), 0.6) * sign # magnitude reduction
+
+    # Mega-block emphasis
+    inst_share500 = row.get("inst_share_ge500", np.nan)
+    if not pd.isna(inst_share500) and inst_share500 > 0.2:
+        score += 0.6 * sign
+
+    # Zone adjustments
+    dist = row.get("strike_distance_pct", np.nan)
+    if not pd.isna(dist):
+        if -2 < dist < 2:       # ATM
+            score *= 1.10
+        elif dist <= -2:        # below spot (support)
+            score += 0.10 * sign
+        else:                   # above spot (resistance)
+            score += -0.10 * sign
+
+    # Premium scaling to reward significant flow
+    prem = float(row.get("premium_sum", 0.0) or 0.0)
+    scale = np.log1p(max(prem, 1.0)) / 15.0  # soft normalization
+    score *= scale
+
+    return score
+
+def add_weighted_bias(tables):
+    bys = tables["by_strike"].copy()
+    bys["weighted_bias_score"] = bys.apply(_weighted_bias_row, axis=1)
+    # Label
+    def label(s):
+        if s >= 0.8: return "Bullish"
+        if s <= -0.8: return "Bearish"
+        return "Neutral"
+    bys["weighted_bias_label"] = bys["weighted_bias_score"].apply(label)
+    tables["by_strike"] = bys
+    return tables
+
+# ============================
 # Hidden Signals
 # ============================
 def hidden_signals(df: pd.DataFrame, by_strike: pd.DataFrame):
     lines_bull, lines_bear = [], []
 
-    # Closing (<0.5) vs Opening (>1.0)
     closing_clusters = by_strike[(by_strike["vol_oi_ratio"].notna()) & (by_strike["vol_oi_ratio"] < 0.5)]
     opening_clusters = by_strike[(by_strike["vol_oi_ratio"].notna()) & (by_strike["vol_oi_ratio"] > 1.0)]
     if not closing_clusters.empty:
@@ -139,7 +199,7 @@ def hidden_signals(df: pd.DataFrame, by_strike: pd.DataFrame):
         if puts_open > calls_open * 1.2: lines_bear.append("**New put positioning** (Vol/OI > 1.0) dominates → *bearish* conviction.")
         if calls_open > puts_open * 1.2: lines_bull.append("**New call positioning** (Vol/OI > 1.0) dominates → *bullish* conviction.")
 
-    # Put/Call IV skew near ATM (±5%)
+    # IV skew near ATM
     near = df[abs(df["strike_distance_pct"])<=5].copy()
     put_iv = near.loc[near["type"]=="Put","iv"].mean(); call_iv = near.loc[near["type"]=="Call","iv"].mean()
     if pd.notnull(put_iv) and pd.notnull(call_iv):
@@ -189,24 +249,26 @@ def build_narrative(tables, df):
     long = float(dte_prem.get("61-120",0) + dte_prem.get(">120",0))
     if near > (mid + long): lines.append("- Premium concentrated **in the next 7 days** → event/earnings hedging likely.")
     elif long > (near + mid): lines.append("- Premium concentrated **far-dated** → longer-term conviction positioning.")
+
     bull, bear = hidden_signals(df, tables["by_strike"])
     if bull:
         lines.append("\n## Hidden Bullish Flags"); [lines.append(f"- {s}") for s in bull]
     if bear:
         lines.append("\n## Hidden Bearish Flags"); [lines.append(f"- {s}") for s in bear]
-    bys = tables["by_strike"].copy().sort_values("premium_sum", ascending=False).head(8)
-    lines.append("\n## Key Levels & Institutional Activity")
+
+    # Key levels with weighted bias
+    bys = tables["by_strike"].copy()
+    bys = bys.sort_values("premium_sum", ascending=False).head(12)
+    lines.append("\n## Key Levels & Institutional Activity (with Weighted Bias)")
     for _, r in bys.iterrows():
-        t, strike, exp = r["type"], r["strike"], r["exp_date"]; prem = _money(r["premium_sum"]); voi = r["vol_oi_ratio"]
+        t, strike, exp = r["type"], r["strike"], r["exp_date"]
+        prem = _money(r["premium_sum"]); voi = r["vol_oi_ratio"]
         inst500 = r["inst_share_ge500"]; dist = r["strike_distance_pct"]
-        story = []
-        if not np.isnan(voi):
-            if voi > 1.0: story.append("new positioning")
-            elif voi < 0.5: story.append("closing/rolling")
-            else: story.append("balanced")
-        if not np.isnan(inst500) and inst500 > 0.2: story.append("mega-blocks")
-        loc = "(near ATM)" if -2 < dist < 2 else ("(support zone)" if dist <= -2 else "(resistance zone)")
-        lines.append(f"- {t} {strike} exp {exp}: {prem} — {', '.join(story)} {loc}")
+        tag = _positioning_tag(voi); zone = _zone_tag(dist)
+        label = r.get("weighted_bias_label","Neutral"); score = r.get("weighted_bias_score", 0.0)
+        lines.append(f"- {t} {strike} exp {exp}: {prem} — {tag}" + (", mega-blocks" if (not pd.isna(inst500) and inst500>0.2) else "") + f" ({zone})  → **{label} {score:+.2f}**")
+
+    # Potential plays (high level)
     lines.append("\n## Potential Plays (Not Advice)")
     if iv_mean >= 0.8:
         lines.append("- **CSPs / Put Credit Spreads** at support clusters (puts 2–5% below spot with strong OI).")
@@ -218,7 +280,7 @@ def build_narrative(tables, df):
 # ============================
 # UI
 # ============================
-st.title("Options Flow Summarizer — Key Levels, OI/Volume/Size + Hidden Signals")
+st.title("Options Flow Summarizer — Hidden Signals + Weighted Bias")
 st.caption("Upload an options-flow CSV (Barchart-style). No manual inputs required.")
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
@@ -238,6 +300,7 @@ if uploaded is not None:
         st.dataframe(df.head(15), use_container_width=True)
 
     tables = _aggregate(df)
+    tables = add_weighted_bias(tables)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Premium", _money(tables["tot_prem"]))
@@ -255,10 +318,11 @@ if uploaded is not None:
     st.subheader("DTE Buckets (Premium Sum)")
     st.dataframe(tables["dte_prem"].rename("premium").to_frame(), use_container_width=True)
 
-    st.subheader("Per-Strike Detail (Institutional/Skew Signals)")
+    st.subheader("Per-Strike Detail (with Weighted Bias Columns)")
     show_cols = ["type","strike","exp_date","premium_sum","oi","vol","vol_oi_ratio",
                  "largest_trade","total_size","inst_share_ge100","inst_share_ge500",
-                 "under_px","strike_distance_pct","iv_mean"]
+                 "under_px","strike_distance_pct","iv_mean",
+                 "weighted_bias_label","weighted_bias_score"]
     st.dataframe(tables["by_strike"][show_cols].sort_values("premium_sum", ascending=False), use_container_width=True)
 
     narrative = build_narrative(tables, df)
@@ -266,7 +330,7 @@ if uploaded is not None:
     st.markdown(narrative)
 
     st.download_button("Download Summary (Markdown)",
-                       data=("# Options Flow Summary (Pro)\n\n"+narrative).encode("utf-8"),
-                       file_name="options_flow_summary_pro.md", mime="text/markdown")
+                       data=("# Options Flow Summary (Weighted)\n\n"+narrative).encode("utf-8"),
+                       file_name="options_flow_summary_weighted.md", mime="text/markdown")
 else:
     st.info("Upload a CSV to get started.")
