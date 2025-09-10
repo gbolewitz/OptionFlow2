@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Options Flow Summarizer — PRO (Hidden Signals + Weighted Gauges)", layout="wide")
+st.set_page_config(page_title="Options Flow Summarizer — PRO (Hidden Signals + Weighted Gauges + Entry Plays)", layout="wide")
 
 # ============================
 # Normalization
@@ -225,6 +225,132 @@ def add_weighted_bias_and_strength(tables):
     return tables
 
 # ============================
+# New Activity Scoring + Play Suggestions
+# ============================
+def _is_opening_flow(row) -> bool:
+    """
+    Proxy for opening interest when we don't have prior-day OI:
+    - Vol/OI > 1.1 indicates more traded volume than existing OI (opening bias).
+    - Large single prints also count as opening bias.
+    """
+    voi = row.get("vol_oi_ratio", np.nan)
+    largest = row.get("largest_trade", 0.0) or 0.0
+    return (pd.notna(voi) and voi > 1.1) or (largest >= 250)  # tweak threshold as you like
+
+def _new_activity_score(row) -> float:
+    """
+    Higher = fresher, more actionable level.
+    Combines: opening signal strength, premium size (log), institutional share, and ATM proximity.
+    """
+    voi = row.get("vol_oi_ratio", np.nan)
+    prem = float(row.get("premium_sum", 0.0) or 0.0)
+    inst = float(row.get("inst_share_ge500", 0.0) or 0.0)
+    dist = row.get("strike_distance_pct", np.nan)
+
+    # Base from opening strength
+    base = 0.0
+    if pd.notna(voi):
+        if voi > 1.1:
+            base = min((voi - 1.0) * 1.5, 2.0)  # cap extreme prints
+        elif voi < 0.7:
+            base = -0.5  # closing bias de-prioritized
+
+    # Institutional boost
+    base += min(inst * 2.0, 1.0)  # up to +1 for strong mega-block share
+
+    # Premium scaling (favor material flow)
+    base *= (np.log1p(prem) / 12.0)
+
+    # ATM proximity nudge (slight boost to actionable levels)
+    if pd.notna(dist):
+        if -2 < dist < 2:
+            base *= 1.10
+        elif dist > 8 or dist < -8:
+            base *= 0.85  # far OTM slightly discounted
+
+    return float(base)
+
+def _zone_tag_for_play(dist):
+    if pd.isna(dist): return "unknown"
+    if dist <= -2: return "support"
+    if -2 < dist < 2: return "ATM"
+    return "resistance"
+
+def _suggest_play(row, iv_mean: float) -> tuple[str, str]:
+    """
+    Heuristic suggestions (NOT ADVICE).
+    - Bullish + high IV → credit put structures at support (CSP / put credit spread)
+    - Bullish + low/med IV → debit call spread slightly OTM
+    - Bearish + high IV → call credit spread near resistance
+    - Bearish + low/med IV → debit put spread slightly OTM
+    """
+    t = str(row.get("type","")).lower()
+    dist = row.get("strike_distance_pct", np.nan)
+    zone = _zone_tag_for_play(dist)
+    strike = row.get("strike")
+    exp = row.get("exp_date")
+    label = row.get("weighted_bias_label","Neutral")
+    score = float(row.get("weighted_bias_score", 0.0))
+
+    # Direction from bias score sign
+    bullish = score > 0
+
+    # Choose structure based on IV regime
+    high_iv = iv_mean >= 0.7
+    width = 2.0  # default width; adjust for your ticker
+
+    if bullish:
+        if high_iv:
+            # Bullish + high IV → get paid: CSP or put credit spread at/under support
+            if zone in ("support","ATM"):
+                return ("Cash-Secured Put / Put Credit Spread",
+                        f"Sell {strike}P (or {strike}P/{strike-width}P credit spread) exp {exp} at {zone}.")
+            else:
+                # if resistance but bullish and high IV, safer: put credit spread below spot
+                return ("Put Credit Spread",
+                        f"Sell {strike-2}P / Buy {strike-2-width}P exp {exp} below spot to keep distance from resistance.")
+        else:
+            # Bullish + low/med IV → buy premium: debit call spread
+            target = strike + width
+            return ("Debit Call Spread",
+                    f"Buy {strike}C / Sell {target}C exp {exp} ({zone}).")
+    else:  # bearish
+        if high_iv:
+            # Bearish + high IV → get paid: call credit spread at/near resistance
+            if zone in ("resistance","ATM"):
+                return ("Call Credit Spread",
+                        f"Sell {strike}C / Buy {strike+width}C exp {exp} at {zone}.")
+            else:
+                # at support but bearish + high IV → safer to position above
+                return ("Call Credit Spread",
+                        f"Sell {strike+2}C / Buy {strike+2+width}C exp {exp} nearer resistance.")
+        else:
+            # Bearish + low/med IV → buy premium: debit put spread
+            target = strike - width
+            return ("Debit Put Spread",
+                    f"Buy {strike}P / Sell {target}P exp {exp} ({zone}).")
+
+def add_new_activity_and_plays(tables):
+    """
+    Adds columns:
+      - opening_flag
+      - new_activity_score
+      - entry_play / entry_note (suggestion)
+    """
+    bys = tables["by_strike"].copy()
+    bys["opening_flag"] = bys.apply(_is_opening_flow, axis=1)
+    bys["new_activity_score"] = bys.apply(_new_activity_score, axis=1)
+
+    # Suggest plays only for rows flagged as opening
+    iv_mean = float(tables["iv_mean"] or 0.0)
+    plays = bys.apply(lambda r: _suggest_play(r, iv_mean) if r["opening_flag"] else ("—", "Filtered: not opening"), axis=1)
+    bys["entry_play"] = [p[0] for p in plays]
+    bys["entry_note"] = [p[1] for p in plays]
+
+    tables["by_strike"] = bys
+    return tables
+
+# ============================
 # Hidden Signals
 # ============================
 def hidden_signals(df: pd.DataFrame, by_strike: pd.DataFrame):
@@ -325,168 +451,4 @@ def build_narrative(tables, df):
         lines.append("\n## Hidden Bullish Flags")
         for s in bull: lines.append(f"- {s}")
     if bear:
-        lines.append("\n## Hidden Bearish Flags")
-        for s in bear: lines.append(f"- {s}")
-
-    # Key levels with tags + weighted bias
-    bys = tables["by_strike"].copy().sort_values("premium_sum", ascending=False).head(12)
-    lines.append("\n## Key Levels & Institutional Activity (with Weighted Bias)")
-    for _, r in bys.iterrows():
-        t, strike, exp = r["type"], r["strike"], r["exp_date"]
-        prem = _money(r["premium_sum"]); voi = r["vol_oi_ratio"]
-        inst500 = r["inst_share_ge500"]; dist = r["strike_distance_pct"]
-        tag = _positioning_tag(voi); zone = _zone_tag(dist)
-        label = r.get("weighted_bias_label","Neutral"); score = r.get("weighted_bias_score", 0.0)
-        megablock = (not pd.isna(inst500) and inst500 > 0.2)
-        lines.append(
-            f"- {t} {strike} exp {exp}: {prem} — {tag}"
-            + (", mega-blocks" if megablock else "")
-            + f" ({zone})  → **{label} {score:+.2f}**"
-        )
-
-    # High-level plays (not advice)
-    lines.append("\n## Potential Plays (Not Advice)")
-    if iv_mean >= 0.8:
-        lines.append("- **CSPs / Put Credit Spreads** at support clusters (puts 2–5% below spot with strong OI).")
-        lines.append("- **Covered Calls** at resistance clusters if long shares.")
-    else:
-        lines.append("- **Debit Call/Put Spreads** when directional bias appears from hidden flags + key levels.")
-    return "\n".join(lines)
-
-# ============================
-# Gauges
-# ============================
-def _gauge(value, title, min_val=-100, max_val=100):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=value,
-        title={'text': title},
-        gauge={
-            'axis': {'range': [min_val, max_val]},
-            'bar': {'color': "black"},
-            'steps': [
-                {'range': [min_val, (min_val+max_val)/3], 'color': "#ffdddd"},
-                {'range': [(min_val+max_val)/3, 0], 'color': "#fff6cc"},
-                {'range': [0, (min_val+max_val)*2/3], 'color': "#e6f7ff"},
-                {'range': [(min_val+max_val)*2/3, max_val], 'color': "#ddffdd"},
-            ],
-        }
-    ))
-    fig.update_layout(height=260, margin=dict(l=10,r=10,t=40,b=10))
-    return fig
-
-def overall_gauge_score(by_strike: pd.DataFrame) -> float:
-    if by_strike.empty:
-        return 0.0
-    s = (by_strike["weighted_bias_score"] * by_strike["level_strength"]).sum()
-    d = by_strike["level_strength"].sum()
-    raw = s/d if d and d>0 else 0.0
-    # map from ~[-2.5,+2.5] to [-100,100]
-    scaled = float(np.clip(raw, -2.5, 2.5) / 2.5 * 100.0)
-    return scaled
-
-def level_gauge_score(row: pd.Series) -> float:
-    # Map per-level score (approx [-3, +3]) to [-100, 100]
-    s = float(np.clip(row.get("weighted_bias_score", 0.0), -3.0, 3.0) / 3.0 * 100.0)
-    return s
-
-# ============================
-# UI
-# ============================
-st.title("Options Flow Summarizer — Hidden Signals + Weighted Gauges")
-st.caption("Upload an options-flow CSV (Barchart-style). The app finds key levels, institutional activity, hidden flags, weighted bias, and shows dial gauges.")
-
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
-
-if uploaded is not None:
-    try:
-        raw = pd.read_csv(uploaded)
-    except Exception as e:
-        st.error(f"Failed to read CSV: {e}")
-        st.stop()
-
-    with st.expander("Raw Preview", expanded=False):
-        st.dataframe(raw.head(25), use_container_width=True)
-
-    df = _norm_cols(raw)
-    st.success("CSV normalized successfully!")
-    with st.expander("Normalized Preview", expanded=False):
-        st.dataframe(df.head(15), use_container_width=True)
-
-    tables = _aggregate(df)
-    tables = add_weighted_bias_and_strength(tables)  # adds weighted_bias_score/label + level_strength
-
-    # Top metrics
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Premium", _money(tables["tot_prem"]))
-    col2.metric("Calls Premium", _money(tables["call_prem"]))
-    col3.metric("Puts Premium", _money(tables["put_prem"]))
-    ivm = tables["iv_mean"] if not pd.isna(tables["iv_mean"]) else 0.0
-    col4.metric("Mean IV (dec)", f"{ivm:.2f}")
-
-    # Overall gauge
-    st.subheader("Overall Bias Gauge")
-    overall_score = overall_gauge_score(tables["by_strike"])
-    st.plotly_chart(_gauge(overall_score, "Net Options Bias (weighted)"), use_container_width=True)
-
-    # Strongest key levels
-    st.subheader("Strongest Key Levels (by level_strength)")
-    strongest = tables["by_strike"].sort_values("level_strength", ascending=False).head(5).copy()
-    st.dataframe(
-        strongest[[
-            "type","strike","exp_date","premium_sum","vol","oi","vol_oi_ratio",
-            "inst_share_ge500","under_px","strike_distance_pct",
-            "weighted_bias_label","weighted_bias_score","level_strength"
-        ]],
-        use_container_width=True
-    )
-
-    # Most bullish / bearish gauges
-    c4, c5 = st.columns(2)
-    most_bullish = tables["by_strike"].sort_values("weighted_bias_score", ascending=False).head(1)
-    most_bearish = tables["by_strike"].sort_values("weighted_bias_score", ascending=True).head(1)
-
-    if not most_bullish.empty:
-        row = most_bullish.iloc[0]
-        c4.subheader(f"Most Bullish Level: {row['type']} {row['strike']} exp {row['exp_date']}")
-        c4.plotly_chart(_gauge(level_gauge_score(row), "Level Bias"), use_container_width=True)
-        c4.caption(f"Score {row['weighted_bias_score']:+.2f} • Premium {_money(row['premium_sum'])} • Vol/OI {row['vol_oi_ratio']:.2f} • Mega-block share {0 if pd.isna(row['inst_share_ge500']) else row['inst_share_ge500']:.2f}")
-
-    if not most_bearish.empty:
-        row = most_bearish.iloc[0]
-        c5.subheader(f"Most Bearish Level: {row['type']} {row['strike']} exp {row['exp_date']}")
-        c5.plotly_chart(_gauge(level_gauge_score(row), "Level Bias"), use_container_width=True)
-        c5.caption(f"Score {row['weighted_bias_score']:+.2f} • Premium {_money(row['premium_sum'])} • Vol/OI {row['vol_oi_ratio']:.2f} • Mega-block share {0 if pd.isna(row['inst_share_ge500']) else row['inst_share_ge500']:.2f}")
-
-    # Expiration / DTE tables
-    st.subheader("Expiration Concentration (Top 5 by Premium)")
-    st.dataframe(tables["exp_prem"].rename("premium").to_frame(), use_container_width=True)
-
-    st.subheader("DTE Buckets (Premium Sum)")
-    st.dataframe(tables["dte_prem"].rename("premium").to_frame(), use_container_width=True)
-
-    # Narrative
-    st.subheader("Narrative Summary")
-    narrative = build_narrative(tables, df)
-    st.markdown(narrative)
-
-    # Detailed table with all computed columns
-    st.subheader("Per-Strike Detail (with Weighted Bias & Strength)")
-    show_cols = [
-        "type","strike","exp_date","premium_sum","oi","vol","vol_oi_ratio",
-        "largest_trade","total_size","inst_share_ge100","inst_share_ge500",
-        "under_px","strike_distance_pct","iv_mean",
-        "weighted_bias_label","weighted_bias_score","level_strength"
-    ]
-    st.dataframe(tables["by_strike"][show_cols].sort_values("level_strength", ascending=False), use_container_width=True)
-
-    # Download summary
-    st.download_button(
-        "Download Summary (Markdown)",
-        data=("# Options Flow Summary — PRO\n\n" + narrative).encode("utf-8"),
-        file_name="options_flow_summary_pro.md",
-        mime="text/markdown"
-    )
-
-else:
-    st.info("Upload a CSV to get started.")
+        lines.append("\n## Hidden B
