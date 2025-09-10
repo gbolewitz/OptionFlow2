@@ -451,4 +451,196 @@ def build_narrative(tables, df):
         lines.append("\n## Hidden Bullish Flags")
         for s in bull: lines.append(f"- {s}")
     if bear:
-        lines.append("\n## Hidden B
+        lines.append("\n## Hidden Bearish Flags")
+        for s in bear: lines.append(f"- {s}")
+
+    # Key levels with tags + weighted bias
+    bys = tables["by_strike"].copy().sort_values("premium_sum", ascending=False).head(12)
+    lines.append("\n## Key Levels & Institutional Activity (with Weighted Bias)")
+    for _, r in bys.iterrows():
+        t, strike, exp = r["type"], r["strike"], r["exp_date"]
+        prem = _money(r["premium_sum"]); voi = r["vol_oi_ratio"]
+        inst500 = r["inst_share_ge500"]; dist = r["strike_distance_pct"]
+        tag = _positioning_tag(voi); zone = _zone_tag(dist)
+        label = r.get("weighted_bias_label","Neutral"); score = r.get("weighted_bias_score", 0.0)
+        megablock = (not pd.isna(inst500) and inst500 > 0.2)
+        lines.append(
+            f"- {t} {strike} exp {exp}: {prem} — {tag}"
+            + (", mega-blocks" if megablock else "")
+            + f" ({zone})  → **{label} {score:+.2f}**"
+        )
+
+    # High-level plays (not advice)
+    lines.append("\n## Potential Plays (Not Advice)")
+    if iv_mean >= 0.8:
+        lines.append("- **CSPs / Put Credit Spreads** at support clusters (puts 2–5% below spot with strong OI).")
+        lines.append("- **Covered Calls** at resistance clusters if long shares.")
+    else:
+        lines.append("- **Debit Call/Put Spreads** when directional bias appears from hidden flags + key levels.")
+    return "\n".join(lines)
+
+# ============================
+# Gauges
+# ============================
+def _gauge(value, title, min_val=-100, max_val=100):
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        title={'text': title},
+        gauge={
+            'axis': {'range': [min_val, max_val]},
+            'bar': {'color': "black"},
+            'steps': [
+                {'range': [min_val, (min_val+max_val)/3], 'color': "#ffdddd"},
+                {'range': [(min_val+max_val)/3, 0], 'color': "#fff6cc"},
+                {'range': [0, (min_val+max_val)*2/3], 'color': "#e6f7ff"},
+                {'range': [(min_val+max_val)*2/3, max_val], 'color': "#ddffdd"},
+            ],
+        }
+    ))
+    fig.update_layout(height=260, margin=dict(l=10,r=10,t=40,b=10))
+    return fig
+
+def overall_gauge_score(by_strike: pd.DataFrame) -> float:
+    if by_strike.empty:
+        return 0.0
+    s = (by_strike["weighted_bias_score"] * by_strike["level_strength"]).sum()
+    d = by_strike["level_strength"].sum()
+    raw = s/d if d and d>0 else 0.0
+    # map from ~[-2.5,+2.5] to [-100,100]
+    scaled = float(np.clip(raw, -2.5, 2.5) / 2.5 * 100.0)
+    return scaled
+
+def level_gauge_score(row: pd.Series) -> float:
+    # Map per-level score (approx [-3, +3]) to [-100, 100]
+    s = float(np.clip(row.get("weighted_bias_score", 0.0), -3.0, 3.0) / 3.0 * 100.0)
+    return s
+
+# ============================
+# UI
+# ============================
+st.title("Options Flow Summarizer — Hidden Signals + Weighted Gauges + Entry Plays")
+st.caption("Upload an options-flow CSV (Barchart-style). The app finds key levels, institutional activity, hidden flags, weighted bias, and shows dial gauges. Now also surfaces opening flow entry candidates with suggested structures (not advice).")
+
+uploaded = st.file_uploader("Upload CSV", type=["csv"])
+
+if uploaded is not None:
+    try:
+        raw = pd.read_csv(uploaded)
+    except Exception as e:
+        st.error(f"Failed to read CSV: {e}")
+        st.stop()
+
+    with st.expander("Raw Preview", expanded=False):
+        st.dataframe(raw.head(25), use_container_width=True)
+
+    df = _norm_cols(raw)
+    st.success("CSV normalized successfully!")
+    with st.expander("Normalized Preview", expanded=False):
+        st.dataframe(df.head(15), use_container_width=True)
+
+    tables = _aggregate(df)
+    tables = add_weighted_bias_and_strength(tables)   # adds weighted_bias_score/label + level_strength
+    tables = add_new_activity_and_plays(tables)       # adds opening_flag/new_activity_score + entry_play/note
+
+    # Top metrics
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Premium", _money(tables["tot_prem"]))
+    col2.metric("Calls Premium", _money(tables["call_prem"]))
+    col3.metric("Puts Premium", _money(tables["put_prem"]))
+    ivm = tables["iv_mean"] if not pd.isna(tables["iv_mean"]) else 0.0
+    col4.metric("Mean IV (dec)", f"{ivm:.2f}")
+
+    # Overall gauge
+    st.subheader("Overall Bias Gauge")
+    overall_score = overall_gauge_score(tables["by_strike"])
+    st.plotly_chart(_gauge(overall_score, "Net Options Bias (weighted)"), use_container_width=True)
+
+    # Strongest key levels
+    st.subheader("Strongest Key Levels (by level_strength)")
+    strongest = tables["by_strike"].sort_values("level_strength", ascending=False).head(5).copy()
+    st.dataframe(
+        strongest[[
+            "type","strike","exp_date","premium_sum","vol","oi","vol_oi_ratio",
+            "inst_share_ge500","under_px","strike_distance_pct",
+            "weighted_bias_label","weighted_bias_score","level_strength"
+        ]],
+        use_container_width=True
+    )
+
+    # Most bullish / bearish gauges
+    c4, c5 = st.columns(2)
+    most_bullish = tables["by_strike"].sort_values("weighted_bias_score", ascending=False).head(1)
+    most_bearish = tables["by_strike"].sort_values("weighted_bias_score", ascending=True).head(1)
+
+    if not most_bullish.empty:
+        row = most_bullish.iloc[0]
+        c4.subheader(f"Most Bullish Level: {row['type']} {row['strike']} exp {row['exp_date']}")
+        c4.plotly_chart(_gauge(level_gauge_score(row), "Level Bias"), use_container_width=True)
+        c4.caption(f"Score {row['weighted_bias_score']:+.2f} • Premium {_money(row['premium_sum'])} • Vol/OI {row['vol_oi_ratio']:.2f} • Mega-block share {0 if pd.isna(row['inst_share_ge500']) else row['inst_share_ge500']:.2f}")
+
+    if not most_bearish.empty:
+        row = most_bearish.iloc[0]
+        c5.subheader(f"Most Bearish Level: {row['type']} {row['strike']} exp {row['exp_date']}")
+        c5.plotly_chart(_gauge(level_gauge_score(row), "Level Bias"), use_container_width=True)
+        c5.caption(f"Score {row['weighted_bias_score']:+.2f} • Premium {_money(row['premium_sum'])} • Vol/OI {row['vol_oi_ratio']:.2f} • Mega-block share {0 if pd.isna(row['inst_share_ge500']) else row['inst_share_ge500']:.2f}")
+
+    # ===== NEW: Entry candidates (New Activity Only) =====
+    st.subheader("Entry Candidates (New Activity Only)")
+    candidates = tables["by_strike"].copy()
+    candidates = candidates[candidates["opening_flag"]]
+    candidates = candidates.sort_values(["new_activity_score","premium_sum"], ascending=[False, False]).head(8)
+
+    cols = [
+        "type","strike","exp_date","premium_sum","vol_oi_ratio","inst_share_ge500",
+        "under_px","strike_distance_pct","weighted_bias_label","weighted_bias_score",
+        "new_activity_score","entry_play","entry_note"
+    ]
+    if not candidates.empty:
+        st.dataframe(candidates[cols], use_container_width=True)
+    else:
+        st.info("No strong opening-flow candidates detected by the current thresholds.")
+
+    # Optional: toggle to focus the big table on opening-only
+    only_opening = st.toggle("Show opening flow only in the detailed table (Vol/OI > 1.1 or large prints)", value=False)
+
+    # Expiration / DTE tables
+    st.subheader("Expiration Concentration (Top 5 by Premium)")
+    st.dataframe(tables["exp_prem"].rename("premium").to_frame(), use_container_width=True)
+
+    st.subheader("DTE Buckets (Premium Sum)")
+    st.dataframe(tables["dte_prem"].rename("premium").to_frame(), use_container_width=True)
+
+    # Narrative
+    st.subheader("Narrative Summary")
+    narrative = build_narrative(tables, df)
+    st.markdown(narrative)
+
+    # Detailed table with all computed columns
+    st.subheader("Per-Strike Detail (with Weighted Bias, Strength & Entry Fields)")
+    show_cols = [
+        "type","strike","exp_date","premium_sum","oi","vol","vol_oi_ratio",
+        "largest_trade","total_size","inst_share_ge100","inst_share_ge500",
+        "under_px","strike_distance_pct","iv_mean",
+        "weighted_bias_label","weighted_bias_score","level_strength",
+        "opening_flag","new_activity_score","entry_play","entry_note"
+    ]
+    table_view = tables["by_strike"][show_cols].copy()
+    if only_opening:
+        table_view = table_view[table_view["opening_flag"]]
+    st.dataframe(table_view.sort_values(
+        ["opening_flag","new_activity_score","level_strength","premium_sum"],
+        ascending=[False, False, False, False]),
+        use_container_width=True
+    )
+
+    # Download summary
+    st.download_button(
+        "Download Summary (Markdown)",
+        data=("# Options Flow Summary — PRO\n\n" + narrative).encode("utf-8"),
+        file_name="options_flow_summary_pro.md",
+        mime="text/markdown"
+    )
+
+else:
+    st.info("Upload a CSV to get started.")
