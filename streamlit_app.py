@@ -411,6 +411,33 @@ def hidden_signals(df: pd.DataFrame, by_strike: pd.DataFrame):
         lines_bull.append("**Far-dated call accumulation** (>120 DTE) detected → quiet *long-term bullish* setup.")
 
     return lines_bull, lines_bear
+# ============================
+# Premium vs Conviction Breakdown
+# ============================
+def conviction_breakdown(by_strike: pd.DataFrame):
+    """
+    Returns both raw and conviction-adjusted totals.
+    - Raw = straight premium sums
+    - Conviction-adjusted = weighted_bias_score * level_strength aggregated by Call/Put
+    """
+    out = {}
+
+    # Raw totals
+    raw_calls = by_strike.loc[by_strike["type"]=="Call", "premium_sum"].sum()
+    raw_puts  = by_strike.loc[by_strike["type"]=="Put", "premium_sum"].sum()
+
+    # Conviction-weighted totals
+    calls_weighted = by_strike.loc[by_strike["type"]=="Call", "weighted_bias_score"] * by_strike.loc[by_strike["type"]=="Call","level_strength"]
+    puts_weighted  = by_strike.loc[by_strike["type"]=="Put", "weighted_bias_score"] * by_strike.loc[by_strike["type"]=="Put","level_strength"]
+
+    adj_calls = calls_weighted.sum()
+    adj_puts  = puts_weighted.sum()
+
+    out["raw_calls"] = raw_calls
+    out["raw_puts"]  = raw_puts
+    out["adj_calls"] = adj_calls
+    out["adj_puts"]  = adj_puts
+    return out
 
 # ============================
 # Narrative Builder
@@ -550,6 +577,22 @@ if uploaded is not None:
     col3.metric("Puts Premium", _money(tables["put_prem"]))
     ivm = tables["iv_mean"] if not pd.isna(tables["iv_mean"]) else 0.0
     col4.metric("Mean IV (dec)", f"{ivm:.2f}")
+    # Premium vs Conviction Breakdown
+    st.subheader("Premium vs Conviction Breakdown")
+    
+    cb = conviction_breakdown(tables["by_strike"])
+    
+    colA, colB = st.columns(2)
+    with colA:
+        st.markdown("**Raw Premium Totals**")
+        st.metric("Calls Premium (raw)", _money(cb["raw_calls"]))
+        st.metric("Puts Premium (raw)", _money(cb["raw_puts"]))
+    
+    with colB:
+        st.markdown("**Conviction-Adjusted Totals**")
+        st.metric("Calls (conviction)", f"{cb['adj_calls']:+.2f}")
+        st.metric("Puts (conviction)", f"{cb['adj_puts']:+.2f}")
+
 
     # Overall gauge
     st.subheader("Overall Bias Gauge")
