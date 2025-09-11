@@ -537,6 +537,53 @@ def build_narrative(tables, df):
     else:
         lines.append("- **Debit Call/Put Spreads** when directional bias appears from hidden flags + key levels.")
     return "\n".join(lines)
+# ============================
+# Breakdown Charts
+# ============================
+import plotly.graph_objects as go
+
+def breakdown_charts(cb: dict):
+    """
+    Returns two Plotly figs:
+      - fig_raw: stacked calls/puts by raw premium (USD)
+      - fig_adj: stacked calls/puts by *absolute* conviction weight, with net label
+    """
+    # --- Raw Premiums (USD) ---
+    fig_raw = go.Figure()
+    fig_raw.add_bar(name="Calls", x=["Raw Premium (USD)"], y=[cb["raw_calls"]])
+    fig_raw.add_bar(name="Puts",  x=["Raw Premium (USD)"], y=[cb["raw_puts"]])
+    fig_raw.update_layout(
+        barmode="stack",
+        yaxis_title="USD",
+        height=320,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend_title_text=""
+    )
+
+    # --- Conviction (weighted units) ---
+    # We stack absolute magnitudes so you can see side contributions clearly,
+    # then annotate the *net* (which can be +/- and is what drives the gauge).
+    calls_abs = abs(cb["adj_calls"])
+    puts_abs  = abs(cb["adj_puts"])
+    net = cb["net_adj"]
+
+    fig_adj = go.Figure()
+    fig_adj.add_bar(name="Calls (abs)", x=["Conviction (weighted)"], y=[calls_abs])
+    fig_adj.add_bar(name="Puts (abs)",  x=["Conviction (weighted)"], y=[puts_abs])
+
+    fig_adj.update_layout(
+        barmode="stack",
+        yaxis_title="Weighted units (abs)",
+        height=320,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend_title_text=""
+    )
+    fig_adj.add_annotation(
+        x=0, y=calls_abs+puts_abs,
+        text=f"Net = {net:+.2f}",
+        showarrow=False, yshift=12, font=dict(size=14)
+    )
+    return fig_raw, fig_adj
 
 # ============================
 # Gauges
@@ -626,6 +673,31 @@ if uploaded is not None:
         st.metric("Calls (conviction)", f"{cb['adj_calls']:+.2f}")
         st.metric("Puts (conviction)", f"{cb['adj_puts']:+.2f}")
 
+    # ===== Premium vs Conviction Breakdown =====
+    st.subheader("Premium vs Conviction Breakdown")
+    
+    cb = conviction_breakdown(tables["by_strike"])
+    
+    colA, colB, colC, colD = st.columns(4)
+    with colA:
+        st.markdown("**Calls Premium (raw)**")
+        st.metric(label="", value=_money(cb["raw_calls"]))
+    with colB:
+        st.markdown("**Puts Premium (raw)**")
+        st.metric(label="", value=_money(cb["raw_puts"]))
+    with colC:
+        st.markdown("**Calls (conviction)**")
+        st.metric(label="", value=f"{cb['adj_calls']:+.2f}")
+    with colD:
+        st.markdown("**Puts (conviction)**")
+        st.metric(label="", value=f"{cb['adj_puts']:+.2f}")
+    
+    fig_raw, fig_adj = breakdown_charts(cb)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(fig_raw, use_container_width=True)
+    with c2:
+        st.plotly_chart(fig_adj, use_container_width=True)
 
     # Overall gauge
     st.subheader("Overall Bias Gauge")
