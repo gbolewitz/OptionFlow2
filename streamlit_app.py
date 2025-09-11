@@ -229,13 +229,13 @@ def add_weighted_bias_and_strength(tables):
 # ============================
 def _is_opening_flow(row) -> bool:
     """
-    Proxy for opening interest when we don't have prior-day OI:
-    - Vol/OI > 1.1 indicates more traded volume than existing OI (opening bias).
-    - Large single prints also count as opening bias.
+    Opening proxy:
+      - Vol/OI > MIN_VOI_OPEN, OR
+      - A large single print >= MIN_BLOCK_SIZE
     """
     voi = row.get("vol_oi_ratio", np.nan)
     largest = row.get("largest_trade", 0.0) or 0.0
-    return (pd.notna(voi) and voi > 1.1) or (largest >= 250)  # tweak threshold as you like
+    return (pd.notna(voi) and voi > MIN_VOI_OPEN) or (largest >= MIN_BLOCK_SIZE)
 
 def _new_activity_score(row) -> float:
     """
@@ -621,12 +621,145 @@ def level_gauge_score(row: pd.Series) -> float:
     # Map per-level score (approx [-3, +3]) to [-100, 100]
     s = float(np.clip(row.get("weighted_bias_score", 0.0), -3.0, 3.0) / 3.0 * 100.0)
     return s
+def _institutional_mask(df: pd.DataFrame) -> pd.Series:
+    # Either ≥100 or ≥500 buckets crossing the sliders
+    s100 = df.get("inst_share_ge100", pd.Series([np.nan]*len(df))).fillna(0)
+    s500 = df.get("inst_share_ge500", pd.Series([np.nan]*len(df))).fillna(0)
+    return (s100 >= INST_100_THRESH) | (s500 >= INST_500_THRESH)
+
+def new_positioning_subset(by_strike: pd.DataFrame) -> pd.DataFrame:
+    """
+    Opening + institutional filter → freshest, most meaningful flow.
+    """
+    df = by_strike.copy()
+    if "opening_flag" not in df.columns:
+        # if user didn't call add_new_activity_and_plays yet, fallback from Vol/OI
+        df["opening_flag"] = df["vol_oi_ratio"].fillna(0) > MIN_VOI_OPEN
+    mask = df["opening_flag"] & _institutional_mask(df)
+    return df[mask].copy()
+
+def new_positioning_gauge_score(open_inst_df: pd.DataFrame) -> float:
+    """
+    Gauge computed ONLY from opening + institutional rows.
+    Same mapping as the global gauge: [-100..+100].
+    """
+    if open_inst_df.empty:
+        return 0.0
+    s = (open_inst_df["weighted_bias_score"] * open_inst_df["level_strength"]).sum()
+    d = open_inst_df["level_strength"].sum()
+    raw = s/d if d and d > 0 else 0.0
+    return float(np.clip(raw, -2.5, 2.5) / 2.5 * 100.0)
+def _roll_tilt(side: str, strike_from: float, strike_to: float, exp_from, exp_to) -> str:
+    """
+    Assign bullish/bearish tilt for a detected roll.
+    side: "Call" or "Put"
+    """
+    call = (str(side).lower() == "call")
+    same_exp = (exp_from == exp_to)
+
+    if same_exp:
+        # VERTICAL roll
+        if call:
+            return "Bullish (roll up)" if strike_to > strike_from else "Bearish (roll down)"
+        else:
+            return "Bearish (roll up puts)" if strike_to > strike_from else "Bullish (roll down puts)"
+    else:
+        # CALENDAR / DIAGONAL
+        # For calls: out in time tends to be bullish; for puts: bearish
+        base = "Bullish (calendar out)" if call else "Bearish (calendar out)"
+        if strike_to != strike_from:
+            # diagonal nuance
+            if call and strike_to > strike_from:
+                base += " + vertical up"
+            elif call and strike_to < strike_from:
+                base += " + vertical down"
+            elif (not call) and strike_to > strike_from:
+                base += " + vertical up puts (bearish)"
+            else:
+                base += " + vertical down puts (bullish)"
+        return base
+
+def detect_roll_pairs(by_strike: pd.DataFrame) -> pd.DataFrame:
+    """
+    Heuristic pairing of likely closing ↔ opening legs within the session.
+    - closers: Vol/OI < 0.5
+    - openers: Vol/OI > MIN_VOI_OPEN
+    - same side; prefer same expiry for verticals (toggle PREFER_SAME_EXP)
+    - match by similar notional (premium_sum) within ROLL_NOTIONAL_TOL
+    Returns a table with: side, from_strike, to_strike, from_exp, to_exp, prem_close, prem_open, roll_type, tilt, match_score
+    """
+    df = by_strike.copy()
+    df = df.assign(prem=df["premium_sum"].fillna(0.0))
+
+    closers = df[(df["vol_oi_ratio"].notna()) & (df["vol_oi_ratio"] < 0.5)].copy()
+    openers = df[(df["vol_oi_ratio"].notna()) & (df["vol_oi_ratio"] > MIN_VOI_OPEN)].copy()
+
+    rows = []
+    for _, c in closers.iterrows():
+        side = c["type"]
+        # Candidates: same side; prefer same expiry
+        cand = openers[openers["type"] == side].copy()
+        if PREFER_SAME_EXP:
+            same_exp = cand[cand["exp_date"] == c["exp_date"]]
+            if not same_exp.empty:
+                cand = same_exp
+
+        if cand.empty:
+            continue
+
+        # Score candidates by notional closeness + simple structural proximity
+        # notional distance
+        cand["notional_dist"] = (cand["prem"] - c["prem"]).abs() / (c["prem"] + 1e-9)
+        cand = cand[cand["notional_dist"] <= ROLL_NOTIONAL_TOL]
+
+        if cand.empty:
+            continue
+
+        # Structural proximity bonus: small strike distance & (optionally) same expiry
+        cand["strike_prox"] = (cand["strike"] - c["strike"]).abs()
+        cand["exp_bonus"] = np.where(cand["exp_date"] == c["exp_date"], 0.0, 0.2)  # small penalty if different exp
+        cand["match_score"] = 1.0 - (0.5*cand["notional_dist"] + 0.3*cand["strike_prox"]/max(1.0, c["strike"]) + 0.2*cand["exp_bonus"])
+
+        best = cand.sort_values("match_score", ascending=False).head(1)
+        if best.empty:
+            continue
+
+        o = best.iloc[0]
+        same_exp = (c["exp_date"] == o["exp_date"])
+        roll_type = "Vertical" if same_exp and (c["strike"] != o["strike"]) else ("Calendar" if (c["strike"] == o["strike"]) and not same_exp else "Diagonal")
+        tilt = _roll_tilt(side, c["strike"], o["strike"], c["exp_date"], o["exp_date"])
+
+        rows.append({
+            "side": side,
+            "from_strike": c["strike"],
+            "to_strike": o["strike"],
+            "from_exp": c["exp_date"],
+            "to_exp": o["exp_date"],
+            "prem_close": c["prem"],
+            "prem_open": o["prem"],
+            "roll_type": roll_type,
+            "tilt": tilt,
+            "match_score": float(o["match_score"])
+        })
+
+    return pd.DataFrame(rows)
 
 # ============================
 # UI
 # ============================
 st.title("Options Flow Summarizer — Hidden Signals + Weighted Gauges + Entry Plays")
 st.caption("Upload an options-flow CSV (Barchart-style). The app finds key levels, institutional activity, hidden flags, weighted bias, and shows dial gauges. Now also surfaces opening flow entry candidates with suggested structures (not advice).")
+
+# --- Sidebar thresholds (optional) ---
+st.sidebar.header("Detection Settings")
+MIN_VOI_OPEN = st.sidebar.slider("Opening Vol/OI threshold", 1.00, 2.00, 1.10, 0.05)
+MIN_BLOCK_SIZE = st.sidebar.slider("Large single print (contracts) → opening bias", 0, 2000, 250, 25)
+INST_100_THRESH = st.sidebar.slider("Institutional filter: share of size ≥100 (0–1)", 0.0, 1.0, 0.10, 0.05)
+INST_500_THRESH = st.sidebar.slider("Institutional filter: share of size ≥500 (0–1)", 0.0, 1.0, 0.20, 0.05)
+
+# Roll pairing knobs (heuristic, if your CSV lacks timestamps/broker)
+ROLL_NOTIONAL_TOL = st.sidebar.slider("Roll notional tolerance (±%)", 0.05, 1.00, 0.30, 0.05)
+PREFER_SAME_EXP = st.sidebar.checkbox("Prefer same expiry when pairing vertical rolls", True)
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
@@ -715,6 +848,36 @@ if uploaded is not None:
         ]],
         use_container_width=True
     )
+    # ===== Institutional New Positioning Bias (fresh) =====
+    st.subheader("Institutional New Positioning (Fresh Flow Only)")
+    
+    open_inst = new_positioning_subset(tables["by_strike"])
+    fresh_score = new_positioning_gauge_score(open_inst)
+    st.plotly_chart(_gauge(fresh_score, "Net Bias (Opening + Institutional Only)"), use_container_width=True)
+    
+    if not open_inst.empty:
+        cols = [
+            "type","strike","exp_date","premium_sum","vol_oi_ratio",
+            "inst_share_ge100","inst_share_ge500","under_px","strike_distance_pct",
+            "weighted_bias_label","weighted_bias_score","level_strength"
+        ]
+        st.dataframe(open_inst.sort_values(["level_strength","premium_sum"], ascending=False)[cols].head(10),
+                     use_container_width=True)
+    else:
+        st.info("No rows passed the opening + institutional filters under the current thresholds.")
+    
+
+    # ===== Rolling Activity (Heuristic) =====
+        st.subheader("Rolling Activity (Heuristic)")
+        
+        rolls_df = detect_roll_pairs(tables["by_strike"])
+        if not rolls_df.empty:
+            st.dataframe(
+                rolls_df.sort_values(["match_score","prem_open","prem_close"], ascending=[False, False, False]),
+                use_container_width=True
+            )
+        else:
+            st.caption("No likely rolls detected under current thresholds (Vol/OI and notional tolerance).")
 
     # Most bullish / bearish gauges
     c4, c5 = st.columns(2)
