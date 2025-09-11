@@ -438,6 +438,38 @@ def conviction_breakdown(by_strike: pd.DataFrame):
     out["adj_calls"] = adj_calls
     out["adj_puts"]  = adj_puts
     return out
+# ============================
+# Premium vs Conviction Breakdown
+# ============================
+def conviction_breakdown(by_strike: pd.DataFrame):
+    """
+    Returns both raw and conviction-adjusted totals.
+    - Raw = straight premium sums
+    - Conviction-adjusted = sum(weighted_bias_score * level_strength) by side
+      (same units as the gauge internals; can be +/-)
+    """
+    out = {}
+
+    # Raw totals
+    raw_calls = by_strike.loc[by_strike["type"]=="Call", "premium_sum"].sum()
+    raw_puts  = by_strike.loc[by_strike["type"]=="Put",  "premium_sum"].sum()
+
+    # Conviction-weighted totals (these can be positive/negative)
+    calls_mask = by_strike["type"]=="Call"
+    puts_mask  = by_strike["type"]=="Put"
+
+    adj_calls = (by_strike.loc[calls_mask, "weighted_bias_score"] *
+                 by_strike.loc[calls_mask, "level_strength"]).sum()
+
+    adj_puts  = (by_strike.loc[puts_mask,  "weighted_bias_score"] *
+                 by_strike.loc[puts_mask,  "level_strength"]).sum()
+
+    out["raw_calls"] = float(raw_calls)
+    out["raw_puts"]  = float(raw_puts)
+    out["adj_calls"] = float(adj_calls)
+    out["adj_puts"]  = float(adj_puts)
+    out["net_adj"]   = float(adj_calls + adj_puts)
+    return out
 
 # ============================
 # Narrative Builder
@@ -577,6 +609,7 @@ if uploaded is not None:
     col3.metric("Puts Premium", _money(tables["put_prem"]))
     ivm = tables["iv_mean"] if not pd.isna(tables["iv_mean"]) else 0.0
     col4.metric("Mean IV (dec)", f"{ivm:.2f}")
+    
     # Premium vs Conviction Breakdown
     st.subheader("Premium vs Conviction Breakdown")
     
@@ -593,6 +626,53 @@ if uploaded is not None:
         st.metric("Calls (conviction)", f"{cb['adj_calls']:+.2f}")
         st.metric("Puts (conviction)", f"{cb['adj_puts']:+.2f}")
 
+# ============================
+# Breakdown Charts
+# ============================
+import plotly.graph_objects as go
+
+def breakdown_charts(cb: dict):
+    """
+    Returns two Plotly figs:
+      - fig_raw: stacked calls/puts by raw premium (USD)
+      - fig_adj: stacked calls/puts by *absolute* conviction weight, with net label
+    """
+    # --- Raw Premiums (USD) ---
+    fig_raw = go.Figure()
+    fig_raw.add_bar(name="Calls", x=["Raw Premium (USD)"], y=[cb["raw_calls"]])
+    fig_raw.add_bar(name="Puts",  x=["Raw Premium (USD)"], y=[cb["raw_puts"]])
+    fig_raw.update_layout(
+        barmode="stack",
+        yaxis_title="USD",
+        height=320,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend_title_text=""
+    )
+
+    # --- Conviction (weighted units) ---
+    # We stack absolute magnitudes so you can see side contributions clearly,
+    # then annotate the *net* (which can be +/- and is what drives the gauge).
+    calls_abs = abs(cb["adj_calls"])
+    puts_abs  = abs(cb["adj_puts"])
+    net = cb["net_adj"]
+
+    fig_adj = go.Figure()
+    fig_adj.add_bar(name="Calls (abs)", x=["Conviction (weighted)"], y=[calls_abs])
+    fig_adj.add_bar(name="Puts (abs)",  x=["Conviction (weighted)"], y=[puts_abs])
+
+    fig_adj.update_layout(
+        barmode="stack",
+        yaxis_title="Weighted units (abs)",
+        height=320,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend_title_text=""
+    )
+    fig_adj.add_annotation(
+        x=0, y=calls_abs+puts_abs,
+        text=f"Net = {net:+.2f}",
+        showarrow=False, yshift=12, font=dict(size=14)
+    )
+    return fig_raw, fig_adj
 
     # Overall gauge
     st.subheader("Overall Bias Gauge")
